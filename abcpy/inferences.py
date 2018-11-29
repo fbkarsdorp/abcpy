@@ -2828,3 +2828,384 @@ class SMCABC(BaseDiscrepancy, InferenceMethod):
                 y_sim = self.accepted_y_sim_bds.value()[index]
 
         return (self.get_parameters(), y_sim, counter)
+
+import emcee, pyGPs
+from QuadMean import Quadratic
+
+
+class GPEMCEE(BaseLikelihood, InferenceMethod):
+    """
+    Gaussian Process coupled with EMCEE.
+
+    This algorithm assumes a likelihood function is available and can be evaluated
+    at any parameter value given the oberved dataset.  In absence of the
+    likelihood function or when it can't be evaluated with a rational
+    computational expenses, we use the approximated likelihood functions in
+    abcpy.approx_lhd module, for which the argument of the consistency of the
+    inference schemes are based on Andrieu and Roberts [2].
+
+    [1] Cappé, O., Guillin, A., Marin, J.-M., and Robert, C. P. (2004). Population Monte Carlo.
+    Journal of Computational and Graphical Statistics, 13(4), 907–929.
+
+    [2] C. Andrieu and G. O. Roberts. The pseudo-marginal approach for efficient Monte Carlo computations.
+    Annals of Statistics, 37(2):697–725, 04 2009.
+
+    Parameters
+    ----------
+    model : list
+        A list of the Probabilistic models corresponding to the observed datasets
+    likfun : abcpy.approx_lhd.Approx_likelihood
+        Approx_likelihood object defining the approximated likelihood to be used.
+    backend : abcpy.backends.Backend
+        Backend object defining the backend to be used.
+    seed : integer, optional
+        Optional initial seed for the random number generator. The default value is generated randomly.
+
+    """
+
+    model = None
+    likfun = None
+    rng = None
+    kernel = None
+    n_samples = None
+    n_samples_per_param = None
+
+    backend = None
+
+
+    def __init__(self, root_models, likfuns, backend, seed=None):
+        self.model = root_models
+        # We define the joint Product of likelihood functions using all the likelihoods for each individual models
+        self.likfun = ProductCombination(root_models, likfuns)
+
+        #mapping, garbage_index = self._get_mapping()
+        #models = []
+        #for mdl, mdl_index in mapping:
+        #    models.append(mdl)
+        #kernel = DefaultKernel(models)
+        #self.kernel = kernel
+        self.backend = backend
+        self.rng = np.random.RandomState(seed)
+
+        self.logger = logging.getLogger(__name__)
+
+        # these are usually big tables, so we broadcast them to have them once
+        # per executor instead of once per task
+        self.accepted_parameters_manager = AcceptedParametersManager(self.model)
+
+        self.simulation_counter = 0
+
+    def sample(self, observations, steps=5, n_samples = 10000, n_samples_per_param = 100, n_design = 100, n_burnin = 100, iniPoints = None, full_output=0, journal_file = None):
+        """Samples from the posterior distribution of the model parameter given the observed
+        data observations.
+
+        Parameters
+        ----------
+        observations : list
+            A list, containing lists describing the observed data sets
+        steps : integer
+            number of iterations in the sequential algoritm ("generations")
+        n_samples : integer, optional
+            number of samples to generate. The default value is 10000.
+        n_samples_per_param : integer, optional
+            number of data points in each simulated data set. The default value is 100.
+        n_design : integer, optional
+            number of design points where we will evaluate the likelihood
+        n_burnin : integer, optional
+            number of burnin samples for EMCEE
+        inipoints : numpy.ndarray, optional
+            parameter vaulues from where the sampling starts. By default sampled from the prior.
+        full_output: integer, optional
+            If full_output==1, intermediate results are included in output journal.
+            The default value is 0, meaning the intermediate results are not saved.
+
+        Returns
+        -------
+        abcpy.output.Journal
+            A journal containing simulation results, metadata and optionally intermediate results.
+        """
+        self.sample_from_prior(rng=self.rng)
+
+        self.accepted_parameters_manager.broadcast(self.backend, observations)
+        self.n_samples = n_samples
+        self.n_samples_per_param = n_samples_per_param
+
+        if(journal_file is None):
+            journal = Journal(full_output)
+            journal.configuration["type_model"] = [type(model).__name__ for model in self.model]
+            journal.configuration["type_lhd_func"] = type(self.likfun).__name__
+            journal.configuration["n_samples"] = self.n_samples
+            journal.configuration["n_samples_per_param"] = self.n_samples_per_param
+            journal.configuration["steps"] = steps
+            journal.configuration["iniPoints"] = iniPoints
+
+        else:
+            journal = Journal.fromFile(journal_file)
+
+        accepted_parameters = None
+        accepted_weights = None
+
+        # The dimension of the parameter space
+        self.dim = len(self.get_parameters())
+
+        # Check whether the number of design points are divisible by 8, ow make it divisible by 8
+        if np.mod(n_design, 8) == 0:
+            self.n_design = n_design
+        else:
+            self.n_design = n_design + (8-np.mod(n_design, 8))
+
+        ## The first (n_design/2) design points found using the Halton sequence
+        #self.design_points = self.halton(self.dim, int(self.n_design/2))*(self.ub-self.lb)+ self.lb
+
+        # Initialize (n_design/2) design points: When not supplied, randomly draw them from prior distribution
+        if iniPoints == None:
+            self.design_points = np.zeros(shape=(int(self.n_design/2), self.dim))
+            for ind in range(0, int(self.n_design/2)):
+                self.sample_from_prior(rng=self.rng)
+                self.design_points[ind, :] = self.get_parameters()
+        else:
+            self.design_points = iniPoints
+
+        # main GPEMCEE algorithm
+        # print("INFO: Starting GPEMCEE iterations.")
+        for aStep in range(0, steps):
+            print(aStep)
+            if aStep == 0:
+            ### Step 1: Compute true loglikelihoods at the initial design points
+                ## Calculate approximate lieklihood for design points
+                # First Sample n_samples_per_param many simulated data for each design points
+                self.logger.info("Calculate approximate likelihood at initial design points")
+                merged_sim_data_parameter = self.flat_map(self.design_points, self.n_samples_per_param, self._simulate_data)
+                # Compute likelihood for each parameter value
+                approx_likelihood_new_parameters, counter = self.simple_map(merged_sim_data_parameter, self._approx_calc)
+                self.loglikelihood_at_design_points = np.array(approx_likelihood_new_parameters).reshape(-1, 1)
+
+                for count in counter:
+                    self.simulation_counter+=count
+            #print(self.loglikelihood_at_design_points)
+
+            ### Step 2: Fitting a Gaussian Process to approximate the loglikelihood: Fit a Gaussian process regressor
+            #  approximating the loglikelihood, where the loglikelihood is the output and the parameter is the input
+            GP = pyGPs.GPR()
+            GP.setPrior(mean=Quadratic(D=4)+pyGPs.mean.Const(), kernel=pyGPs.cov.Matern())
+            GP.getPosterior(self.design_points, -self.loglikelihood_at_design_points)  # fit default model (mean zero & rbf kernel) with data
+            GP.optimize(self.design_points, -self.loglikelihood_at_design_points)
+
+            ## Define the surrogate loglikelihood function
+            def loglikelihoodsurrogate(x):
+                if self.pdf_of_prior(self.model, x) != 0:
+                    negloglikelihood_pred = GP.predict(x.reshape(1,-1))[0][0][0]
+                    return -negloglikelihood_pred
+                else:
+                    return -10e+20
+
+            aaa = np.zeros(shape=(self.design_points.shape[0],))
+            for ind in range(self.design_points.shape[0]):
+                aaa[ind] = loglikelihoodsurrogate(self.design_points[ind,:])
+
+            import matplotlib.pyplot as plt
+
+            fig, (ax1, ax2) = plt.subplots(nrows=2)
+
+            ax1.tricontour(self.design_points[:, 0].reshape(-1, ), self.design_points[:, 1].reshape(-1, ), self.loglikelihood_at_design_points.reshape(-1, ), 14,
+                           linewidths=0.5, colors='k')
+            cntr1 = ax1.tricontourf(self.design_points[:, 0].reshape(-1, ), self.design_points[:, 1].reshape(-1, ),
+                                    self.loglikelihood_at_design_points.reshape(-1, ), 14, cmap="RdBu_r")
+            fig.colorbar(cntr1, ax=ax1)
+            ax1.plot(self.design_points[:, 0].reshape(-1, ), self.design_points[:, 1].reshape(-1, ), 'ko', ms=3)
+
+            ax2.tricontour(self.design_points[:, 0].reshape(-1, ), self.design_points[:, 1].reshape(-1, ), aaa.reshape(-1, ), 14,
+                           linewidths=0.5, colors='k')
+            cntr2 = ax2.tricontourf(self.design_points[:, 0].reshape(-1, ), self.design_points[:, 1].reshape(-1, ),
+                                    aaa.reshape(-1, ), 14, cmap="RdBu_r")
+            fig.colorbar(cntr2, ax=ax2)
+            ax2.plot(self.design_points[:, 0].reshape(-1, ), self.design_points[:, 1].reshape(-1, ), 'ko', ms=3)
+
+            plt.show()
+
+            ### Step 3: Draw samples by EMCEE using Gaussian process approximation of the approximate likelihood finction
+            ## Initiate the sampler: #ndim = dimension of the parameter space, #nwalkers
+            n_walkers, n_dim = 10, self.dim
+            if aStep == 0:
+                p0 = self.design_points[self.rng.choice(self.design_points.shape[0],n_walkers),:]
+            else:
+                p0 = temporary_samples[self.rng.choice(temporary_samples.shape[0],n_walkers),:]
+            emceesampler = emcee.EnsembleSampler(n_walkers, n_dim, loglikelihoodsurrogate)
+            # Burn-in Step
+            pos, prob, state = emceesampler.run_mcmc(p0, n_burnin)
+            emceesampler.reset()
+            # MCMC sampling
+            emceesampler.run_mcmc(pos, 10000)#int(self.n_samples/n_walkers))
+            temporary_samples = emceesampler.flatchain
+
+            plt.figure()
+            plt.plot(temporary_samples[:,0], temporary_samples[:,1],'*')
+            plt.xlim([0, 1])
+            plt.ylim([0, 1])
+            plt.show()
+
+            ## (Repeat of Step 1): Add new design points until the penultimate step
+            if aStep < steps-1:
+                # New design point by resampling (n_design_points/8) from the samples drawn by emcee sampler
+                #new_design_points = self.halton(self.dim, int(self.n_design / 8))
+                new_design_points = temporary_samples[self.rng.choice(temporary_samples.shape[0], int(self.n_design / 8)),:]
+                # Compute likelihood in these new design points
+                # First Sample n_samples_per_param many simulated data for each design points
+                self.logger.info("Calculate approximate likelihood at new design points")
+                merged_sim_data_parameter = self.flat_map(new_design_points, self.n_samples_per_param, self._simulate_data)
+                # Compute likelihood for each parameter value
+                approx_likelihood_new_parameters, counter = self.simple_map(merged_sim_data_parameter, self._approx_calc)
+                loglikelihood_at_new_design_points = np.array(approx_likelihood_new_parameters).reshape(-1, 1)
+
+                # Update the design points by adding the new design points
+                self.design_points = np.vstack((self.design_points,new_design_points))
+                # Update the likelihood at design points by adding the new computed likelihoods at those new design points
+                self.loglikelihood_at_design_points = np.vstack((self.loglikelihood_at_design_points, loglikelihood_at_new_design_points))
+
+        # 5: Return the samples drawn by emcee sampler at the final step
+        accepted_parameters = temporary_samples[:n_samples,:]
+
+        journal.add_parameters(accepted_parameters)
+        journal.add_opt_values(self.design_points)
+        journal.add_opt_values(self.loglikelihood_at_design_points)
+        self.accepted_parameters_manager.update_broadcast(self.backend, accepted_parameters=accepted_parameters)
+        names_and_parameters = self._get_names_and_parameters()
+        journal.add_user_parameters(names_and_parameters)
+        journal.number_of_simulations.append(self.simulation_counter)
+
+        return journal, accepted_parameters, self.design_points, self.loglikelihood_at_design_points, aaa
+
+
+    ## Simple_map and Flat_map: Python wrapper for nested parallelization
+    def simple_map(self, data, map_function):
+        data_pds = self.backend.parallelize(data)
+        result_pds = self.backend.map(map_function, data_pds)
+        result = self.backend.collect(result_pds)
+        main_result, counter = [list(t) for t in zip(*result)]
+        return main_result, counter
+    def flat_map(self, data, n_repeat, map_function):
+        repeated_data = np.repeat(data, n_repeat, axis=0)
+        repeated_data_pds = self.backend.parallelize(repeated_data)
+        repeated_data__result_pds = self.backend.map(map_function, repeated_data_pds)
+        repeated_data_result = self.backend.collect(repeated_data__result_pds)
+        repeated_data, result = [list(t) for t in zip(*repeated_data_result)]
+        merged_result_data = []
+        for ind in range(0, data.shape[0]):
+            merged_result_data.append([[[result[np.int(i)][0][0] \
+                                         for i in
+                                         np.where(np.mean(repeated_data == data[ind, :], axis=1) == 1)[0]]],
+                                       data[ind, :]])
+        return merged_result_data
+
+    # define helper functions for map step
+    def _simulate_data(self, theta):
+        """
+        Simulate n_sample_per_param many datasets for new parameter
+        Parameters
+        ----------
+        theta: numpy.ndarray
+            1xp matrix containing the model parameters, where p is the number of parameters
+        Returns
+        -------
+        (theta, sim_data)
+            tehta and simulate data
+        """
+
+        # Simulate the fake data from the model given the parameter value theta
+        # print("DEBUG: Simulate model for parameter " + str(theta))
+        self.set_parameters(theta)
+        y_sim = self.simulate(1, self.rng)
+
+        return (theta, y_sim)
+
+    def _approx_calc(self, sim_data_parameter):
+        """
+        Compute likelihood for new parameters using approximate likelihood function
+        Parameters
+        ----------
+        sim_data_parameter: list
+            First element is the parameter and the second element is the simulated data
+        Returns
+        -------
+        float
+            The approximated likelihood function
+        """
+        # Extract data and parameter
+        y_sim, theta = sim_data_parameter[0], sim_data_parameter[1]
+
+        # print("DEBUG: Extracting observation.")
+        obs = self.accepted_parameters_manager.observations_bds.value()
+        # print("DEBUG: Computing likelihood...")
+
+        total_pdf_at_theta = 1.
+
+        lhd = self.likfun.likelihood(obs, y_sim)
+
+        # print("DEBUG: Likelihood is :" + str(lhd))
+        pdf_at_theta = self.pdf_of_prior(self.model, theta)
+
+        total_pdf_at_theta *= (pdf_at_theta * lhd)
+
+        if total_pdf_at_theta == 0:
+            return (-10e+20, 1)
+        else:
+            return (np.log(total_pdf_at_theta), 1)
+        # print("DEBUG: prior pdf evaluated at theta is :" + str(pdf_at_theta))
+
+
+    def _primes_from_2_to(self, n):
+        """Prime number from 2 to n.
+
+        From `StackOverflow <https://stackoverflow.com/questions/2068372>`_.
+
+        :param int n: sup bound with ``n >= 6``.
+        :return: primes in 2 <= p < n.
+        :rtype: list
+        """
+        sieve = np.ones(n // 3 + (n % 6 == 2), dtype=np.bool)
+        for i in range(1, int(n ** 0.5) // 3 + 1):
+            if sieve[i]:
+                k = 3 * i + 1 | 1
+                sieve[k * k // 3::2 * k] = False
+                sieve[k * (k - 2 * (i & 1) + 4) // 3::2 * k] = False
+        return np.r_[2, 3, ((3 * np.nonzero(sieve)[0][1:] + 1) | 1)]
+
+    def _van_der_corput(self, n_sample, base=2):
+        """Van der Corput sequence.
+
+        :param int n_sample: number of element of the sequence.
+        :param int base: base of the sequence.
+        :return: sequence of Van der Corput.
+        :rtype: list (n_samples,)
+        """
+        sequence = []
+        for i in range(n_sample):
+            n_th_number, denom = 0., 1.
+            while i > 0:
+                i, remainder = divmod(i, base)
+                denom *= base
+                n_th_number += remainder / denom
+            sequence.append(n_th_number)
+
+        return sequence
+
+    def halton(self, dim, n_sample):
+        """Halton sequence.
+
+        :param int dim: dimension
+        :param int n_sample: number of samples.
+        :return: sequence of Halton.
+        :rtype: array_like (n_samples, n_features)
+        """
+        big_number = 10
+        while 'Not enought primes':
+            base = self._primes_from_2_to(big_number)[:dim]
+            if len(base) == dim:
+                break
+            big_number += 1000
+
+        # Generate a sample using a Van der Corput sequence per dimension.
+        sample = [self._van_der_corput(n_sample + 1, dim) for dim in base]
+        sample = np.stack(sample, axis=-1)[1:]
+
+        return sample
